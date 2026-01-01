@@ -7,6 +7,7 @@
 #define MOTOR_EN PA1   // EN pin for PWM (IN1)
 #define MOTOR_PH PA2   // PH pin for direction (IN2)
 #define MOTOR_CURRENT PA3
+#define DRIVER_SLEEP PA15
 
 #define CAN_ID_COMMAND 0x3FD
 #define CAN_ID_CONFIG 0x3FF
@@ -18,8 +19,8 @@ static CAN_message_t rxMsg, txMsg;
 
 HardwareTimer *MyTim = NULL;
 
-float ENGAGE_CURRENT_THRESHOLD = 4.0; // Default 4A
-float DISENGAGE_THRESHOLD = 2.0; // Default 2A
+float ENGAGE_CURRENT_THRESHOLD = 5.5; // Default 6A
+float DISENGAGE_THRESHOLD = 3; // Default 4A
 
 bool ledState = false;
 unsigned long lastBlink = 0;
@@ -28,10 +29,10 @@ unsigned long engageStart = 0;
 unsigned long disengageStart = 0;
 const unsigned long BLINK_INTERVAL = 200;
 const unsigned long STATUS_INTERVAL = 500;
-const unsigned long ENGAGE_TIMEOUT = 15000; // 10 seconds (shared for engage/disengage)
-const unsigned long MIN_ENGAGE_RUN_TIME = 4000; // 4 seconds minimum before checking current
-const unsigned long MIN_DISENGAGE_RUN_TIME = 4000; // 4 seconds minimum before checking current
-const unsigned long DISENGAGE_RAMP_TIME = 2000; // 2 seconds at 100% before dropping to 50% PWM
+const unsigned long ENGAGE_TIMEOUT = 15000; // 15 seconds (shared for engage/disengage)
+const unsigned long MIN_ENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
+const unsigned long MIN_DISENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
+const unsigned long DISENGAGE_RAMP_TIME = 500; // 0.5 seconds at 100% before dropping to 50% PWM
 
 enum BrakeState {
   DISENGAGED = 0,
@@ -51,24 +52,30 @@ float getCurrent(int pin) {
 
 void setMotor(int mode, bool lowSpeed = false) {
   // mode: 1 = engage (forward), -1 = disengage (reverse), 0 = stop
-  // lowSpeed: true for 50% PWM on EN during disengage ramp-down
-  int duty = lowSpeed ? 50 : 100;
+  // lowSpeed: true for 30% PWM on EN during disengage ramp-down
+  int duty = lowSpeed ? 25 : 100;
+
+  digitalWrite(DRIVER_SLEEP, HIGH); // wakeup driver
 
   if (mode == 1) { // Engage: PH HIGH, EN PWM
-    digitalWrite(MOTOR_PH, LOW);
+    digitalWrite(MOTOR_PH, HIGH);
     MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT); // EN 100% or 50% (unused for engage)
   } else if (mode == -1) { // Disengage: PH LOW, EN PWM
-    digitalWrite(MOTOR_PH, HIGH);
+    digitalWrite(MOTOR_PH, LOW);
     MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT); // EN 100% or 50%
   } else { // Stop: EN 0%
     MyTim->setCaptureCompare(2, 0, PERCENT_COMPARE_FORMAT);
   }
+
+  digitalWrite(DRIVER_SLEEP, HIGH); // shutdown driver
+
 }
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(MOTOR_EN, OUTPUT);
   pinMode(MOTOR_PH, OUTPUT);
+  pinMode(DRIVER_SLEEP, OUTPUT);
   pinMode(MOTOR_CURRENT, INPUT_ANALOG);
   
   MyTim = new HardwareTimer(TIM2);
@@ -96,6 +103,7 @@ void setup() {
   txMsg.flags.extended = 0;
   
   currentState = DISENGAGED; // Initial state
+  digitalWrite(DRIVER_SLEEP, HIGH); // shutdown driver
 }
 
 void loop() {
@@ -111,6 +119,11 @@ void loop() {
   // Gather Inputs
   static bool parkRequested = false;
   float brakeCurrent = getCurrent(MOTOR_CURRENT);
+
+  // Smooth with EWMA for stability (reduces oscillations from load noise)
+  static float prev_brakeCurrent = 0.0f;  // Persistent across calls
+  brakeCurrent = 0.05f * brakeCurrent + 0.95f * prev_brakeCurrent;
+  prev_brakeCurrent = brakeCurrent;
   
   // Read CAN messages
   while (Can.read(rxMsg)) 
@@ -169,9 +182,9 @@ void loop() {
       } else {
         setMotor(-1); // 100% initially
       }
-      // Only check current after ramp (at 50% PWM) to avoid low-duty false negatives
+      // Only check current after ramp (at 50% PWM) and min runtime to avoid low-duty false negatives
       if (currentMillis - disengageStart >= DISENGAGE_RAMP_TIME) {
-        if (brakeCurrent >= DISENGAGE_THRESHOLD) {
+        if (currentMillis - disengageStart >= MIN_DISENGAGE_RUN_TIME && brakeCurrent >= DISENGAGE_THRESHOLD) {
           setMotor(0); // Stop on current rise
           currentState = DISENGAGED;
         } else if (currentMillis - disengageStart >= ENGAGE_TIMEOUT) {
@@ -179,7 +192,7 @@ void loop() {
           currentState = DISENGAGED;
         }
       }
-      break;
+  break;
     case ENGAGE_FAILED:
       if (!parkRequested) {
         currentState = DISENGAGING;
