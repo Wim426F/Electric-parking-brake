@@ -2,6 +2,7 @@
 #include <STM32_CAN.h>
 #include <EEPROM.h>
 #include <math.h>  // For isnan() and fabs()
+#include <STM32LowPower.h>
 
 #define LED_PIN PB12
 #define MOTOR_EN PA1   // EN pin for PWM (IN1)
@@ -12,7 +13,9 @@
 #define CAN_ID_COMMAND 0x3FD
 #define CAN_ID_CONFIG 0x3FF
 #define CAN_ID_STATUS 0x3FE
+#define CAN_ID_VEHICLE_STATE 0x480
 #define PARK_DIRECTION 32
+#define VEHICLE_ON_BYTE 0x32
 
 STM32_CAN Can(CAN1, DEF);
 static CAN_message_t rxMsg, txMsg;
@@ -27,12 +30,17 @@ unsigned long lastBlink = 0;
 unsigned long lastStatus = 0;
 unsigned long engageStart = 0;
 unsigned long disengageStart = 0;
+unsigned long lastVehicleOnMsg = 0;
+unsigned long sleepDelayStart = 0;
+
 const unsigned long BLINK_INTERVAL = 200;
 const unsigned long STATUS_INTERVAL = 500;
 const unsigned long ENGAGE_TIMEOUT = 15000; // 15 seconds (shared for engage/disengage)
 const unsigned long MIN_ENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
 const unsigned long MIN_DISENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
-const unsigned long DISENGAGE_RAMP_TIME = 500; // 0.5 seconds at 100% before dropping to 50% PWM
+const unsigned long DISENGAGE_RAMP_TIME = 400; // 0.5 seconds at 100% before dropping to 50% PWM
+const unsigned long VEHICLE_ON_TIMEOUT = 2000; // 2 seconds without 0x480 msg = vehicle off
+const unsigned long SLEEP_DELAY = 600000; // 10 minutes (600,000 ms) to wait before sleep
 
 enum BrakeState {
   DISENGAGED = 0,
@@ -43,6 +51,15 @@ enum BrakeState {
 };
 BrakeState currentState = DISENGAGED;
 
+enum SleepState {
+  AWAKE = 0,
+  WAITING_FOR_BRAKE_FINISH = 1,
+  WAITING_FOR_CAN_QUIET = 2
+};
+SleepState sleepState = AWAKE;
+
+bool vehicleOn = false;
+
 float getCurrent(int pin) {
   int adc = analogRead(pin);
   float voltage = (adc / 1024.0) * 3.3;
@@ -52,8 +69,8 @@ float getCurrent(int pin) {
 
 void setMotor(int mode, bool lowSpeed = false) {
   // mode: 1 = engage (forward), -1 = disengage (reverse), 0 = stop
-  // lowSpeed: true for 30% PWM on EN during disengage ramp-down
-  int duty = lowSpeed ? 25 : 100;
+  // lowSpeed: true for 25% PWM on EN during disengage ramp-down
+  int duty = lowSpeed ? 20 : 100;
 
   digitalWrite(DRIVER_SLEEP, HIGH); // wakeup driver
 
@@ -69,6 +86,25 @@ void setMotor(int mode, bool lowSpeed = false) {
 
   digitalWrite(DRIVER_SLEEP, HIGH); // shutdown driver
 
+}
+
+void enterSleepMode() {
+  setMotor(0);
+  digitalWrite(LED_PIN, HIGH); // Off when HIGH
+
+  if (MyTim != NULL) {
+    MyTim->pause();
+  }
+
+  // CAN RX line goes low on the start-of-frame bit; use it as the wake source.
+  LowPower.attachInterruptWakeup(PA11, NULL, FALLING);
+
+  LowPower.deepSleep();
+
+  // Stop mode preserves RAM but leaves peripherals (CAN especially) in an
+  // unusable state. Force a full reset so setup() re-runs and every peripheral
+  // — current and future — is reinitialized from scratch.
+  NVIC_SystemReset();
 }
 
 void setup() {
@@ -103,6 +139,8 @@ void setup() {
   txMsg.flags.extended = 0;
   
   currentState = DISENGAGED; // Initial state
+  sleepState = AWAKE;
+  vehicleOn = false;
   digitalWrite(DRIVER_SLEEP, HIGH); // shutdown driver
 }
 
@@ -128,7 +166,18 @@ void loop() {
   // Read CAN messages
   while (Can.read(rxMsg)) 
   {
-    if (rxMsg.id == CAN_ID_COMMAND && rxMsg.len >= 3) // Message from VCU, lever position
+    if (rxMsg.id == CAN_ID_VEHICLE_STATE && rxMsg.len >= 2) // Vehicle state message
+    {
+      vehicleOn = (rxMsg.buf[1] == VEHICLE_ON_BYTE);
+      if (vehicleOn) {
+        lastVehicleOnMsg = currentMillis;
+        // If we were waiting to sleep, cancel it
+        if (sleepState != AWAKE) {
+          sleepState = AWAKE;
+        }
+      }
+    }
+    else if (rxMsg.id == CAN_ID_COMMAND && rxMsg.len >= 3) // Message from VCU, lever position
     {
       parkRequested = (rxMsg.buf[2] == PARK_DIRECTION);
     } 
@@ -144,6 +193,11 @@ void loop() {
       DISENGAGE_THRESHOLD = constrain(DISENGAGE_THRESHOLD, 1.0, 10.0);
       EEPROM.put(4, DISENGAGE_THRESHOLD);
     }
+  }
+  
+  // Check if vehicle has turned off (no 0x480 message for VEHICLE_ON_TIMEOUT)
+  if (lastVehicleOnMsg > 0 && (currentMillis - lastVehicleOnMsg >= VEHICLE_ON_TIMEOUT)) {
+    vehicleOn = false;
   }
   
   // Process State Machine
@@ -198,6 +252,48 @@ void loop() {
         currentState = DISENGAGING;
         disengageStart = currentMillis;
         setMotor(-1); // Disengage at 100%
+      }
+      break;
+  }
+  
+  // Process Sleep State Machine
+  switch (sleepState) {
+    case AWAKE:
+      // Check if vehicle has turned off
+      if (!vehicleOn && lastVehicleOnMsg > 0) {
+        // Check if brake operation is in progress
+        if (currentState == ENGAGING || currentState == DISENGAGING) {
+          sleepState = WAITING_FOR_BRAKE_FINISH;
+        } else {
+          // Brake is idle, start waiting for CAN to go quiet
+          sleepState = WAITING_FOR_CAN_QUIET;
+          sleepDelayStart = currentMillis;
+        }
+      }
+      break;
+      
+    case WAITING_FOR_BRAKE_FINISH:
+      // Wait until brake operation completes
+      if (currentState == DISENGAGED || currentState == ENGAGED || currentState == ENGAGE_FAILED) {
+        sleepState = WAITING_FOR_CAN_QUIET;
+        sleepDelayStart = currentMillis;
+      }
+      // If vehicle turns back on, return to awake
+      if (vehicleOn) {
+        sleepState = AWAKE;
+      }
+      break;
+      
+    case WAITING_FOR_CAN_QUIET:
+      // Wait for 10 minutes of no vehicle activity
+      if (currentMillis - sleepDelayStart >= SLEEP_DELAY) {
+        // Time to sleep
+        enterSleepMode();
+        // After waking up, we'll be back in AWAKE state
+      }
+      // If vehicle turns back on, return to awake
+      if (vehicleOn) {
+        sleepState = AWAKE;
       }
       break;
   }
