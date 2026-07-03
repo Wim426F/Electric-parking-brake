@@ -22,8 +22,10 @@ static CAN_message_t rxMsg, txMsg;
 
 HardwareTimer *MyTim = NULL;
 
-float ENGAGE_CURRENT_THRESHOLD = 5.5; // Default 6A
-float DISENGAGE_THRESHOLD = 3; // Default 4A
+// Supply voltage upgraded 13.8V -> 24V (ratio 24/13.8 = 1.74).
+// Stall current = V/R, so the clamp/stall detection currents scale up with supply voltage.
+float ENGAGE_CURRENT_THRESHOLD = 5.5;
+float DISENGAGE_THRESHOLD = 3;
 
 bool ledState = false;
 unsigned long lastBlink = 0;
@@ -35,12 +37,13 @@ unsigned long sleepDelayStart = 0;
 
 const unsigned long BLINK_INTERVAL = 200;
 const unsigned long STATUS_INTERVAL = 500;
-const unsigned long ENGAGE_TIMEOUT = 15000; // 15 seconds (shared for engage/disengage)
-const unsigned long MIN_ENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
-const unsigned long MIN_DISENGAGE_RUN_TIME = 3000; // 4 seconds minimum before checking current
-const unsigned long DISENGAGE_RAMP_TIME = 400; // 0.5 seconds at 100% before dropping to 50% PWM
-const unsigned long VEHICLE_ON_TIMEOUT = 2000; // 2 seconds without 0x480 msg = vehicle off
-const unsigned long SLEEP_DELAY = 600000; // 10 minutes (600,000 ms) to wait before sleep
+// Motor-travel times scale down by 13.8/24 = 0.575 because the motor runs ~1.74x faster at 24V.
+const unsigned long ENGAGE_TIMEOUT = 15000;
+const unsigned long MIN_ENGAGE_RUN_TIME = 3000;
+const unsigned long MIN_DISENGAGE_RUN_TIME = 1725; // 3000 * 13.8/24, blank inrush before checking current
+const unsigned long DISENGAGE_RAMP_TIME = 230; // 400 * 13.8/24, time at 100% before dropping to low-speed PWM
+const unsigned long VEHICLE_ON_TIMEOUT = 2000; // CAN-bus timing, not motor-dependent: unchanged
+const unsigned long SLEEP_DELAY = 600000;
 
 enum BrakeState {
   DISENGAGED = 0,
@@ -69,8 +72,9 @@ float getCurrent(int pin) {
 
 void setMotor(int mode, bool lowSpeed = false) {
   // mode: 1 = engage (forward), -1 = disengage (reverse), 0 = stop
-  // lowSpeed: true for 25% PWM on EN during disengage ramp-down
-  int duty = lowSpeed ? 20 : 100;
+  // lowSpeed: true for gentle PWM on EN during disengage ramp-down.
+  // Scaled 20% -> 12% (20 * 13.8/24) so the effective approach voltage/speed matches the 13.8V setup.
+  int duty = lowSpeed ? 12 : 100;
 
   digitalWrite(DRIVER_SLEEP, HIGH); // wakeup driver
 
@@ -123,12 +127,12 @@ void setup() {
   
   float savedEngageThreshold;
   EEPROM.get(0, savedEngageThreshold);
-  if (!isnan(savedEngageThreshold) && savedEngageThreshold >= 1.0 && savedEngageThreshold <= 10.0) {
+  if (!isnan(savedEngageThreshold) && savedEngageThreshold >= 1 && savedEngageThreshold <= 20) {
     ENGAGE_CURRENT_THRESHOLD = savedEngageThreshold;
   }
   float savedDisengageThreshold;
   EEPROM.get(4, savedDisengageThreshold);
-  if (!isnan(savedDisengageThreshold) && savedDisengageThreshold >= 1.0 && savedDisengageThreshold <= 10.0) {
+  if (!isnan(savedDisengageThreshold) && savedDisengageThreshold >= 1 && savedDisengageThreshold <= 20) {
     DISENGAGE_THRESHOLD = savedDisengageThreshold;
   }
   
@@ -185,12 +189,12 @@ void loop() {
     {
       uint16_t rawEngageCurrent = (rxMsg.buf[1] << 8) | rxMsg.buf[0];
       ENGAGE_CURRENT_THRESHOLD = rawEngageCurrent / 10.0;
-      ENGAGE_CURRENT_THRESHOLD = constrain(ENGAGE_CURRENT_THRESHOLD, 1.0, 10.0);
+      ENGAGE_CURRENT_THRESHOLD = constrain(ENGAGE_CURRENT_THRESHOLD, 1.0, 20.0);
       EEPROM.put(0, ENGAGE_CURRENT_THRESHOLD);
 
       uint16_t rawDisengageCurrent = (rxMsg.buf[3] << 8) | rxMsg.buf[2];
       DISENGAGE_THRESHOLD = rawDisengageCurrent / 10.0;
-      DISENGAGE_THRESHOLD = constrain(DISENGAGE_THRESHOLD, 1.0, 10.0);
+      DISENGAGE_THRESHOLD = constrain(DISENGAGE_THRESHOLD, 1.0, 20.0);
       EEPROM.put(4, DISENGAGE_THRESHOLD);
     }
   }
@@ -230,9 +234,9 @@ void loop() {
       }
       break;
     case DISENGAGING:
-      // PWM ramp: 100% for first 2s, then 50%
+      // PWM ramp: 100% for DISENGAGE_RAMP_TIME, then drop to low-speed duty
       if (currentMillis - disengageStart >= DISENGAGE_RAMP_TIME) {
-        setMotor(-1, true); // Switch to 50% after 2s to avoid ramming end stop and getting stuck
+        setMotor(-1, true); // Low speed to avoid ramming end stop and getting stuck
       } else {
         setMotor(-1); // 100% initially
       }
@@ -299,7 +303,13 @@ void loop() {
   }
   
   // Send Status
-  if (currentMillis - lastStatus >= STATUS_INTERVAL) {
+  unsigned long status_interval = STATUS_INTERVAL;
+  if (currentState == ENGAGING || currentState == DISENGAGING)
+  {
+    status_interval = 100; // burst status during movement for more accurate tracking.
+  }
+
+  if (currentMillis - lastStatus >= status_interval) {
     lastStatus = currentMillis;
     txMsg.buf[0] = currentState;
     uint16_t rawEngageThreshold = ENGAGE_CURRENT_THRESHOLD * 10;
