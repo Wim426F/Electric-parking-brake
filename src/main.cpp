@@ -14,6 +14,7 @@
 #define CAN_ID_CONFIG 0x3FF
 #define CAN_ID_STATUS 0x3FE
 #define CAN_ID_VEHICLE_STATE 0x480
+#define CAN_ID_SPEED 0xCE // 206 DSC WheelSpeeds: 4x int16 LE, 0.0625 kph/bit
 #define PARK_DIRECTION 32
 #define VEHICLE_ON_BYTE 0x32
 
@@ -45,12 +46,18 @@ const unsigned long DISENGAGE_RAMP_TIME = 230; // 400 * 13.8/24, time at 100% be
 const unsigned long VEHICLE_ON_TIMEOUT = 2000; // CAN-bus timing, not motor-dependent: unchanged
 const unsigned long SLEEP_DELAY = 600000;
 
+// Wheel-speed thresholds (kph). Hysteresis: a park request at/above MOVING_SPEED
+// triggers an emergency clamp; the vehicle is only "stopped" below STANDSTILL_SPEED.
+const float MOVING_SPEED = 3.0;
+const float STANDSTILL_SPEED = 2.0;
+
 enum BrakeState {
   DISENGAGED = 0,
   ENGAGING = 1,
   ENGAGED = 2,
   DISENGAGING = 3,
-  ENGAGE_FAILED = 4
+  ENGAGE_FAILED = 4,
+  EMERGENCY_CLAMPING = 5
 };
 BrakeState currentState = DISENGAGED;
 
@@ -62,6 +69,7 @@ enum SleepState {
 SleepState sleepState = AWAKE;
 
 bool vehicleOn = false;
+float maxWheelSpeed = 0.0f; // Highest wheel-speed magnitude (kph) from 0xCE
 
 float getCurrent(int pin) {
   int adc = analogRead(pin);
@@ -184,7 +192,19 @@ void loop() {
     else if (rxMsg.id == CAN_ID_COMMAND && rxMsg.len >= 3) // Message from VCU, lever position
     {
       parkRequested = (rxMsg.buf[2] == PARK_DIRECTION);
-    } 
+    }
+    else if (rxMsg.id == CAN_ID_SPEED && rxMsg.len >= 8) // DSC individual wheel speeds
+    {
+      // Track the fastest wheel: during hard braking a single wheel can lock and
+      // read ~0 while the car still moves, so standstill must mean ALL wheels stopped.
+      float maxSpeed = 0.0f;
+      for (int i = 0; i < 8; i += 2) {
+        int16_t raw = (int16_t)(rxMsg.buf[i] | (rxMsg.buf[i + 1] << 8));
+        float wheel = fabs(raw * 0.0625f);
+        if (wheel > maxSpeed) maxSpeed = wheel;
+      }
+      maxWheelSpeed = maxSpeed;
+    }
     else if (rxMsg.id == CAN_ID_CONFIG && rxMsg.len >= 4) // Configuration message
     {
       uint16_t rawEngageCurrent = (rxMsg.buf[1] << 8) | rxMsg.buf[0];
@@ -203,14 +223,41 @@ void loop() {
   if (lastVehicleOnMsg > 0 && (currentMillis - lastVehicleOnMsg >= VEHICLE_ON_TIMEOUT)) {
     vehicleOn = false;
   }
-  
+
+  // Derived wheel-speed flags. If no 0xCE has been seen, maxWheelSpeed stays 0,
+  // so vehicleMoving is false and we fall back to the normal (static) engage.
+  bool vehicleMoving = (maxWheelSpeed >= MOVING_SPEED);
+  bool vehicleStopped = (maxWheelSpeed < STANDSTILL_SPEED);
+
   // Process State Machine
   switch (currentState) {
     case DISENGAGED:
       if (parkRequested) {
-        currentState = ENGAGING;
         engageStart = currentMillis;
+        // Park requested while rolling -> emergency clamp (keep driving until we
+        // stop, then latch). Otherwise a normal static engage.
+        currentState = vehicleMoving ? EMERGENCY_CLAMPING : ENGAGING;
         setMotor(1); // Engage at 100%
+      }
+      break;
+    case EMERGENCY_CLAMPING:
+      // Keep clamping the whole time the car is still rolling. The current->force
+      // reading is only valid at standstill: a spinning disc adds kinetic drag
+      // current and trips the threshold early, at too low an actual clamp force.
+      // Once every wheel is stopped we re-clamp to the target current and latch.
+      setMotor(1); // hold full clamp while decelerating
+      if (!parkRequested) { // Abort and disengage
+        currentState = DISENGAGING;
+        disengageStart = currentMillis;
+        setMotor(-1); // Disengage at 100%
+      } else if (vehicleStopped &&
+                 currentMillis - engageStart >= MIN_ENGAGE_RUN_TIME &&
+                 brakeCurrent >= ENGAGE_CURRENT_THRESHOLD) {
+        setMotor(0); // Stopped and clamped to target force -> latch
+        currentState = ENGAGED;
+      } else if (currentMillis - engageStart >= ENGAGE_TIMEOUT) {
+        setMotor(0); // Never reached a clamped standstill in time
+        currentState = ENGAGE_FAILED;
       }
       break;
     case ENGAGING:
@@ -266,7 +313,7 @@ void loop() {
       // Check if vehicle has turned off
       if (!vehicleOn && lastVehicleOnMsg > 0) {
         // Check if brake operation is in progress
-        if (currentState == ENGAGING || currentState == DISENGAGING) {
+        if (currentState == ENGAGING || currentState == DISENGAGING || currentState == EMERGENCY_CLAMPING) {
           sleepState = WAITING_FOR_BRAKE_FINISH;
         } else {
           // Brake is idle, start waiting for CAN to go quiet
@@ -304,7 +351,7 @@ void loop() {
   
   // Send Status
   unsigned long status_interval = STATUS_INTERVAL;
-  if (currentState == ENGAGING || currentState == DISENGAGING)
+  if (currentState == ENGAGING || currentState == DISENGAGING || currentState == EMERGENCY_CLAMPING)
   {
     status_interval = 100; // burst status during movement for more accurate tracking.
   }
