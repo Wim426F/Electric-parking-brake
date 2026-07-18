@@ -23,10 +23,8 @@ static CAN_message_t rxMsg, txMsg;
 
 HardwareTimer *MyTim = NULL;
 
-// Supply voltage upgraded 13.8V -> 24V (ratio 24/13.8 = 1.74).
-// Stall current = V/R, so the clamp/stall detection currents scale up with supply voltage.
-float ENGAGE_CURRENT_THRESHOLD = 5.5;
-float DISENGAGE_THRESHOLD = 3;
+float ENGAGE_CURRENT_THRESHOLD = 8;
+float DISENGAGE_THRESHOLD = 0.5;
 
 bool ledState = false;
 unsigned long lastBlink = 0;
@@ -38,13 +36,14 @@ unsigned long sleepDelayStart = 0;
 
 const unsigned long BLINK_INTERVAL = 200;
 const unsigned long STATUS_INTERVAL = 500;
-// Motor-travel times scale down by 13.8/24 = 0.575 because the motor runs ~1.74x faster at 24V.
-const unsigned long ENGAGE_TIMEOUT = 15000;
-const unsigned long MIN_ENGAGE_RUN_TIME = 3000;
-const unsigned long MIN_DISENGAGE_RUN_TIME = 1725; // 3000 * 13.8/24, blank inrush before checking current
-const unsigned long DISENGAGE_RAMP_TIME = 230; // 400 * 13.8/24, time at 100% before dropping to low-speed PWM
+const unsigned long ENGAGE_TIMEOUT = 5000;
+const unsigned long MIN_ENGAGE_RUN_TIME = 1000;
+const unsigned long MIN_DISENGAGE_RUN_TIME = 3000; // disengage is 3x slower then enage.
+const unsigned long DISENGAGE_RAMP_TIME = 250; // ms at 100% before lower speed releasing
+const unsigned long DISENGAGE_TIMEOUT = 2000; // Hard stop: if no current rise is seen, give up and latch DISENGAGED
+const unsigned long EMERGENCY_RAMP_TIME = 500; // Emergency clamp: ramp EN 0 -> 90% over this time
 const unsigned long VEHICLE_ON_TIMEOUT = 2000; // CAN-bus timing, not motor-dependent: unchanged
-const unsigned long SLEEP_DELAY = 600000;
+const unsigned long SLEEP_DELAY = 600000; 
 
 // Wheel-speed thresholds (kph). Hysteresis: a park request at/above MOVING_SPEED
 // triggers an emergency clamp; the vehicle is only "stopped" below STANDSTILL_SPEED.
@@ -59,7 +58,7 @@ enum BrakeState {
   ENGAGE_FAILED = 4,
   EMERGENCY_CLAMPING = 5
 };
-BrakeState currentState = DISENGAGED;
+BrakeState currentState = ENGAGED;
 
 enum SleepState {
   AWAKE = 0,
@@ -78,20 +77,20 @@ float getCurrent(int pin) {
   return fabs(signedCurrent); // Return absolute value (positive magnitude)
 }
 
-void setMotor(int mode, bool lowSpeed = false) {
+void setMotor(int mode, bool lowSpeed = false, int customDuty = -1) {
   // mode: 1 = engage (forward), -1 = disengage (reverse), 0 = stop
   // lowSpeed: true for gentle PWM on EN during disengage ramp-down.
-  // Scaled 20% -> 12% (20 * 13.8/24) so the effective approach voltage/speed matches the 13.8V setup.
-  int duty = lowSpeed ? 12 : 100;
+  // customDuty: if >= 0, overrides duty (used for the emergency-clamp ramp-up).
+  int duty = (customDuty >= 0) ? customDuty : (lowSpeed ? 25 : 50); // 20 and 60 worked fine. TEST pls
 
   digitalWrite(DRIVER_SLEEP, HIGH); // wakeup driver
 
   if (mode == 1) { // Engage: PH HIGH, EN PWM
     digitalWrite(MOTOR_PH, HIGH);
-    MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT); // EN 100% or 50% (unused for engage)
+    MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT);
   } else if (mode == -1) { // Disengage: PH LOW, EN PWM
     digitalWrite(MOTOR_PH, LOW);
-    MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT); // EN 100% or 50%
+    MyTim->setCaptureCompare(2, duty, PERCENT_COMPARE_FORMAT);
   } else { // Stop: EN 0%
     MyTim->setCaptureCompare(2, 0, PERCENT_COMPARE_FORMAT);
   }
@@ -150,7 +149,7 @@ void setup() {
   txMsg.len = 7; // State (1) + engage threshold (2) + disengage threshold (2) + measured current (2)
   txMsg.flags.extended = 0;
   
-  currentState = DISENGAGED; // Initial state
+  currentState = ENGAGED; // Initial state
   sleepState = AWAKE;
   vehicleOn = false;
   digitalWrite(DRIVER_SLEEP, HIGH); // shutdown driver
@@ -167,12 +166,12 @@ void loop() {
   }
   
   // Gather Inputs
-  static bool parkRequested = false;
+  static bool parkRequested = true;
   float brakeCurrent = getCurrent(MOTOR_CURRENT);
 
-  // Smooth with EWMA for stability (reduces oscillations from load noise)
-  static float prev_brakeCurrent = 0.0f;  // Persistent across calls
-  brakeCurrent = 0.05f * brakeCurrent + 0.95f * prev_brakeCurrent;
+  // Smooth with EWMA for stability
+  static float prev_brakeCurrent = 0.0f;
+  brakeCurrent = 0.5f * brakeCurrent + 0.5f * prev_brakeCurrent;
   prev_brakeCurrent = brakeCurrent;
   
   // Read CAN messages
@@ -227,7 +226,6 @@ void loop() {
   // Derived wheel-speed flags. If no 0xCE has been seen, maxWheelSpeed stays 0,
   // so vehicleMoving is false and we fall back to the normal (static) engage.
   bool vehicleMoving = (maxWheelSpeed >= MOVING_SPEED);
-  bool vehicleStopped = (maxWheelSpeed < STANDSTILL_SPEED);
 
   // Process State Machine
   switch (currentState) {
@@ -240,26 +238,26 @@ void loop() {
         setMotor(1); // Engage at 100%
       }
       break;
-    case EMERGENCY_CLAMPING:
-      // Keep clamping the whole time the car is still rolling. The current->force
-      // reading is only valid at standstill: a spinning disc adds kinetic drag
-      // current and trips the threshold early, at too low an actual clamp force.
-      // Once every wheel is stopped we re-clamp to the target current and latch.
-      setMotor(1); // hold full clamp while decelerating
+    case EMERGENCY_CLAMPING: {
+      // Same as a normal engage, but ramp the PWM from 0 -> 90% over EMERGENCY_RAMP_TIME.
+      unsigned long elapsed = currentMillis - engageStart;
+      int rampDuty = (elapsed >= EMERGENCY_RAMP_TIME)
+                       ? 90
+                       : (int)(90UL * elapsed / EMERGENCY_RAMP_TIME);
+      setMotor(1, false, rampDuty);
       if (!parkRequested) { // Abort and disengage
         currentState = DISENGAGING;
         disengageStart = currentMillis;
         setMotor(-1); // Disengage at 100%
-      } else if (vehicleStopped &&
-                 currentMillis - engageStart >= MIN_ENGAGE_RUN_TIME &&
-                 brakeCurrent >= ENGAGE_CURRENT_THRESHOLD) {
-        setMotor(0); // Stopped and clamped to target force -> latch
+      } else if (elapsed >= MIN_ENGAGE_RUN_TIME && brakeCurrent >= ENGAGE_CURRENT_THRESHOLD) {
+        setMotor(0); // Clamped to target force -> latch
         currentState = ENGAGED;
-      } else if (currentMillis - engageStart >= ENGAGE_TIMEOUT) {
-        setMotor(0); // Never reached a clamped standstill in time
+      } else if (elapsed >= ENGAGE_TIMEOUT) {
+        setMotor(0); // Never reached target clamp force in time
         currentState = ENGAGE_FAILED;
       }
       break;
+    }
     case ENGAGING:
       if (currentMillis - engageStart >= MIN_ENGAGE_RUN_TIME && brakeCurrent >= ENGAGE_CURRENT_THRESHOLD) {
         setMotor(0); // Stop
@@ -292,8 +290,8 @@ void loop() {
         if (currentMillis - disengageStart >= MIN_DISENGAGE_RUN_TIME && brakeCurrent >= DISENGAGE_THRESHOLD) {
           setMotor(0); // Stop on current rise
           currentState = DISENGAGED;
-        } else if (currentMillis - disengageStart >= ENGAGE_TIMEOUT) {
-          setMotor(0); // Stop on timeout
+        } else if (currentMillis - disengageStart >= DISENGAGE_TIMEOUT) {
+          setMotor(0); // Hard stop: current never rose (e.g. input-side sensor reads ~0)
           currentState = DISENGAGED;
         }
       }
@@ -336,7 +334,7 @@ void loop() {
       break;
       
     case WAITING_FOR_CAN_QUIET:
-      // Wait for 10 minutes of no vehicle activity
+      // Wait for few minutes of no vehicle activity
       if (currentMillis - sleepDelayStart >= SLEEP_DELAY) {
         // Time to sleep
         enterSleepMode();
@@ -353,7 +351,7 @@ void loop() {
   unsigned long status_interval = STATUS_INTERVAL;
   if (currentState == ENGAGING || currentState == DISENGAGING || currentState == EMERGENCY_CLAMPING)
   {
-    status_interval = 100; // burst status during movement for more accurate tracking.
+    status_interval = 50; // burst status during movement for more accurate tracking.
   }
 
   if (currentMillis - lastStatus >= status_interval) {
