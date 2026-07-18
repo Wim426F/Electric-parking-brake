@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "STM32",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/libopeninv/include",
+                "${workspaceFolder}/libopencm3/include"
+            ],
+            "defines": [
+                "STM32F1",
+                "T_DEBUG=0"
+            ],
+            "compilerPath": "C:/Program Files (x86)/arm-gnu-toolchain/bin/arm-none-eabi-gcc.exe",
+            "compilerArgs": ["-mcpu=cortex-m3", "-mthumb"],
+            "cStandard": "gnu99",
+            "cppStandard": "c++11",
+            "intelliSenseMode": "gcc-arm"
+        }
+    ],
+    "version": 4
+}
