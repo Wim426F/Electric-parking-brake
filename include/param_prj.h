@@ -52,7 +52,7 @@
 /*              category     name              unit       min     max     default id */
 #define PARAM_LIST \
     PARAM_ENTRY(CAT_COMM,    canspeed,         CANSPEEDS, 0,      4,      2,      1   ) \
-    PARAM_ENTRY(CAT_COMM,    nodeid,           "",        1,      63,     48,     2   ) \
+    PARAM_ENTRY(CAT_COMM,    nodeid,           "",        1,      63,     51,     2   ) \
     PARAM_ENTRY(CAT_BRAKE,   engage_current,   "A",       1,      20,     8,      3   ) \
     PARAM_ENTRY(CAT_BRAKE,   release_current,  "A",       0.1,    20,     0.5,    4   ) \
     PARAM_ENTRY(CAT_BRAKE,   engage_timeout,   "ms",      1000,   60000,  5000,   5   ) \

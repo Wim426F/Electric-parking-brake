@@ -171,12 +171,18 @@ extern "C" int main(void)
    while(1)
    {
       char c = 0;
+      CanSdo::SdoFrame* sdoFrame = sdo.GetPendingUserspaceSdo();
 
       t.Run();
 
       if (canSdo->GetPrintRequest() == PRINT_JSON)
       {
          TerminalCommands::PrintParamsJson(canSdo, &c);
+      }
+      if (0 != sdoFrame)
+      {
+         SdoCommands::ProcessStandardCommands(sdoFrame);
+         sdo.SendSdoReply(sdoFrame);
       }
    }
 

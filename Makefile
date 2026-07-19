@@ -47,8 +47,8 @@ DEPENDS  = $(patsubst %.o,obj/%.d, $(OBJSL))
 vpath %.c src/ libopeninv/src
 vpath %.cpp src/ libopeninv/src
 
-OPENOCD_BASE	= /c/openocd
-OPENOCD		= $(OPENOCD_BASE)/bin/openocd.exe
+OPENOCD_BASE	= /usr
+OPENOCD			= $(OPENOCD_BASE)/bin/openocd
 OPENOCD_SCRIPTS	= $(OPENOCD_BASE)/share/openocd/scripts
 OPENOCD_FLASHER	= $(OPENOCD_SCRIPTS)/interface/stlink.cfg
 OPENOCD_BOARD	= $(OPENOCD_SCRIPTS)/target/stm32f1x.cfg
